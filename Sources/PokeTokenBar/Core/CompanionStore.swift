@@ -52,6 +52,7 @@ final class CompanionStore {
     private var activeGeneration = 0
     private var lastAutoSnapshotDate: Date?
     private(set) var availableSnapshots: [SaveSnapshot] = []
+    private var currentTodayDate: String?
 
     // MARK: 난이도 배율 (설정 — UserDefaults)
     //
@@ -165,7 +166,7 @@ final class CompanionStore {
 
     /// 현재 유효 연속 코딩 일수.
     var streakDays: Int {
-        state.streak.effectiveDays(todayDate: LocalUsageReader.todayKey())
+        state.streak.effectiveDays(todayDate: currentTodayDate ?? LocalUsageReader.todayKey())
     }
 
     /// 연속 코딩 스트릭에 따른 성장 배율 (3일 1.1x, 7일 1.25x, 14일 1.35x, 30일 1.5x).
@@ -808,6 +809,7 @@ final class CompanionStore {
 
     /// 구버전에서 업그레이드 시 월 경계를 보존하는 일별 원장으로 스트릭을 초기 1회 시드.
     func bootstrapStreakIfNeeded(from ledger: UsageLedger, todayDate: String) {
+        currentTodayDate = todayDate.isEmpty ? nil : todayDate
         guard !state.streakFeatureSeeded, ledger.covers(todayDate) else { return }
         let threshold = dailyStreakThreshold
         let fmt = LocalUsageReader.localDayFormatter()
@@ -847,26 +849,28 @@ final class CompanionStore {
     func update(todayTokensByProvider: [String: Int], todayDate: String, monthTotal: Int,
                 burnTier: BurnTier, limitWarning: Bool, hasUsageData: Bool,
                 streakLedger: UsageLedger? = nil) {
+        currentTodayDate = todayDate.isEmpty ? nil : todayDate
         let todayTokens = todayTokensByProvider.values.reduce(0, +)
         // `hasUsageData`는 표시용 snapshot 존재 여부이고, 이 map은 오늘 날짜가 확인된
         // provider 데이터만 담는다. stale snapshot이나 today == nil carrier만 있는 refresh는
         // ledger의 기준점을 움직일 수 있는 관측으로 취급하지 않는다.
         let hasCurrentProviderData = hasUsageData && !todayTokensByProvider.isEmpty
-        if hasCurrentProviderData {
-            if needsStreakBootstrap {
-                if state.installBaselineSet, let streakLedger {
-                    bootstrapStreakIfNeeded(from: streakLedger, todayDate: todayDate)
-                } else if !state.installBaselineSet {
-                    state.streakFeatureSeeded = true
-                    save()
-                }
+        if needsStreakBootstrap {
+            // 기존 설치(installBaselineSet)의 완료된 refresh는 오늘 사용량이 없는 상태(today == nil
+            // 히스토리 carrier)여도 일별 원장(streakLedger)이 채워져 도착하므로, 오늘 첫 사용을 기다리지
+            // 않고 아침 스트릭과 성장 배율을 즉시 복원한다.
+            if state.installBaselineSet, hasUsageData, let streakLedger {
+                bootstrapStreakIfNeeded(from: streakLedger, todayDate: todayDate)
+            } else if !state.installBaselineSet, hasCurrentProviderData {
+                state.streakFeatureSeeded = true
+                save()
             }
-            if todayTokens >= dailyStreakThreshold {
-                let prevLastDay = state.streak.lastDay
-                state.streak.recordActiveDay(todayDate)
-                if state.streak.lastDay != prevLastDay {
-                    save()
-                }
+        }
+        if hasCurrentProviderData, todayTokens >= dailyStreakThreshold {
+            let prevLastDay = state.streak.lastDay
+            state.streak.recordActiveDay(todayDate)
+            if state.streak.lastDay != prevLastDay {
+                save()
             }
         }
         if !state.installBaselineSet {
@@ -1953,6 +1957,7 @@ final class CompanionStore {
     func applySave(_ envelope: SaveEnvelope, todayTokensByProvider: [String: Int], todayDate: String,
                    hasUsageData: Bool) throws {
         try backupStateBeforeImport()
+        currentTodayDate = todayDate.isEmpty ? nil : todayDate
         state = SaveTransfer.rebasedForThisDevice(envelope.state,
                                                   current: state,
                                                   todayTokensByProvider: todayTokensByProvider,

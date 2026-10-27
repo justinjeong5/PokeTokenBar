@@ -286,6 +286,94 @@ final class StreakMultiplierTests: XCTestCase {
         XCTAssertFalse(store.needsStreakBootstrap)
     }
 
+    func testCompletedHistoryOnlyRefreshOnIdleDayBootstrapsSevenDayMorningStreak() async {
+        let fmt = LocalUsageReader.localDayFormatter()
+        let now = Date()
+        let today = fmt.string(from: now)
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+
+        // Seven qualifying days ending yesterday, and 0 tokens today (idle morning).
+        var series: [DailyUsage] = []
+        for offset in (1...7).reversed() {
+            let dayDate = calendar.date(byAdding: .day, value: -offset, to: now)!
+            series.append(DailyUsage(
+                date: fmt.string(from: dayDate), inputTokens: 0, outputTokens: 0,
+                cacheCreationTokens: 0, cacheReadTokens: 0,
+                totalTokens: 12_000_000, totalCost: 0, costCoverage: .empty))
+        }
+        let yesterday = series.last!.date
+        series.append(DailyUsage(
+            date: today, inputTokens: 0, outputTokens: 0,
+            cacheCreationTokens: 0, cacheReadTokens: 0,
+            totalTokens: 0, totalCost: 0, costCoverage: .empty))
+
+        var initialState = CompanionState()
+        initialState.installBaselineSet = true
+        initialState.lastDate = yesterday
+        initialState.claimedTodayTokensByProvider = ["claude_code": 12_000_000]
+
+        let companion = makeStore(state: initialState)
+        XCTAssertTrue(companion.needsStreakBootstrap)
+        XCTAssertEqual(companion.streakDays, 0)
+        XCTAssertEqual(companion.eggHatchThreshold, 5_000_000)
+
+        let suiteName = "streak-idle-refresh-\(UUID().uuidString)"
+        let usageDefaults = UserDefaults(suiteName: suiteName)!
+        defer { usageDefaults.removePersistentDomain(forName: suiteName) }
+
+        let totalTokens = series.reduce(0) { $0 + $1.totalTokens }
+        let enrichment = ProviderEnrichment(
+            activeBlock: nil,
+            blocksOK: true,
+            weekTotal: PeriodUsage(period: yesterday, totalTokens: totalTokens, totalCost: 0),
+            monthTotal: PeriodUsage(period: LocalUsageReader.monthKey(now), totalTokens: totalTokens, totalCost: 0),
+            monthDaily: series,
+            periodsOK: true,
+            lastUsage: calendar.date(byAdding: .day, value: -1, to: now))
+        let historyOnlyProvider = IdleDayHistoryProvider(id: "claude_code", enrichment: enrichment)
+        let usage = UsageStore(
+            providers: [historyOnlyProvider],
+            claudeLimitsProvider: NoStreakClaudeLimits(),
+            discoverClaudeConfigDirs: { [] },
+            codexLimitsProvider: NoStreakCodexLimits(),
+            antigravityLimitsProvider: NoStreakAntigravityLimits(),
+            cursorLimitsProvider: NoStreakCursorLimits(),
+            statusProvider: NoStreakProviderStatus(),
+            autoRefresh: false,
+            defaults: usageDefaults)
+        usage.disableKeychainAccess = true
+        usage.onRefresh = { [weak usage, weak companion] in
+            guard let usage, let companion else { return }
+            companion.update(
+                todayTokensByProvider: usage.todayTokensByProvider,
+                todayDate: today,
+                monthTotal: usage.monthTotalTokens,
+                burnTier: usage.burnTier,
+                limitWarning: usage.isLimitWarning,
+                hasUsageData: usage.hasUsageData,
+                streakLedger: companion.needsStreakBootstrap ? usage.dailyLedger : nil)
+        }
+
+        await usage.refresh()
+
+        // The completed refresh has a positive historical carrier (`today == nil`), so
+        // `todayTokensByProvider` is empty while `hasUsageData` and `dailyLedger` are populated.
+        XCTAssertTrue(usage.hasUsageData)
+        XCTAssertTrue(usage.todayTokensByProvider.isEmpty)
+
+        // Streak bootstrap must complete from the historical ledger without waiting for today's first usage.
+        XCTAssertFalse(companion.needsStreakBootstrap)
+        XCTAssertEqual(companion.state.streak, StreakState(days: 7, lastDay: yesterday))
+        XCTAssertEqual(companion.streakDays, 7)
+        XCTAssertEqual(companion.streakMultiplier, 1.25)
+        XCTAssertEqual(companion.eggHatchThreshold, 4_000_000)
+        XCTAssertEqual(companion.eggTokensToHatch, 4_000_000)
+        // Current-token bookkeeping guard remains intact when `todayTokensByProvider` is empty.
+        XCTAssertEqual(companion.state.lastDate, yesterday)
+        XCTAssertEqual(companion.state.claimedTodayTokensByProvider, ["claude_code": 12_000_000])
+    }
+
     func testTrackedAccountChangeDoesNotMasqueradeAsCompletedRefresh() {
         let suiteName = "streak-account-change-\(UUID().uuidString)"
         let defaults = UserDefaults(suiteName: suiteName)!
@@ -464,4 +552,44 @@ private struct SeededDiffRNG: RandomNumberGenerator {
         z = (z ^ (z >> 27)) &* 0x94D0_49BB_1331_11EB
         return z ^ (z >> 31)
     }
+}
+
+private enum StreakTestStubError: Error { case unavailable }
+
+private struct NoStreakClaudeLimits: ClaudeLimitsProviding {
+    func fetch(allowKeychainPrompt: Bool) async throws -> LimitStatus { throw StreakTestStubError.unavailable }
+}
+
+private struct NoStreakCodexLimits: CodexLimitsProviding {
+    func fetch() async throws -> CodexRateLimitStatus? { nil }
+}
+
+private struct NoStreakAntigravityLimits: AntigravityLimitsProviding {
+    func fetch(allowKeychainPrompt: Bool) async throws -> AntigravityRateLimitStatus {
+        throw StreakTestStubError.unavailable
+    }
+}
+
+private struct NoStreakCursorLimits: CursorLimitsProviding {
+    func fetch() async throws -> CursorRateLimitStatus? { nil }
+}
+
+private struct NoStreakProviderStatus: ProviderStatusProviding {
+    func fetch() async -> [String: ProviderStatus] { [:] }
+}
+
+private final class IdleDayHistoryProvider: UsageProvider, @unchecked Sendable {
+    let id: String
+    let displayName: String
+    let reportsCost: Bool = true
+    let enrichment: ProviderEnrichment
+
+    init(id: String, enrichment: ProviderEnrichment) {
+        self.id = id
+        self.displayName = id
+        self.enrichment = enrichment
+    }
+
+    func fetchDaily() async throws -> DailyUsage? { nil }
+    func fetchEnrichment() async -> ProviderEnrichment { enrichment }
 }
