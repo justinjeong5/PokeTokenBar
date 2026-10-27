@@ -717,4 +717,79 @@ final class MonthDailyTrendTests: XCTestCase {
         XCTAssertFalse(MonthDailyTrend.shouldShowSurface(
             peak: 0, hasAvailableHistory: true, isSelectable: false))
     }
+
+    /// Late on the DST fall-back day (`2026-11-01 23:59 PST` in `America/Los_Angeles`), 21 calendar days
+    /// span more than `21 * 86,400` seconds because `2026-11-01` is 25 hours long. The first visible day
+    /// of the 21-day chart (`2026-10-12`) starts at `00:00 PDT` (`07:00Z`), whereas `now - 21 * 86,400`
+    /// lands at `00:59 PDT` (`07:59Z`). A completed session modified at `2026-10-12 00:30 PDT` (`07:30Z`)
+    /// must be included by `enrichmentScanStart`, both direct and cached scans, and the 21-day chart.
+    func testTwentyOneDayScanIncludesEarlyMorningTranscriptOnFirstDayAcrossDSTFallBack() async throws {
+        let laZone = try XCTUnwrap(TimeZone(identifier: "America/Los_Angeles"))
+        let previousTZ = getenv("TZ").map { String(cString: $0) }
+        let previousDefault = NSTimeZone.default
+        setenv("TZ", "America/Los_Angeles", 1)
+        tzset()
+        CFTimeZoneResetSystem()
+        NSTimeZone.resetSystemTimeZone()
+        NSTimeZone.default = laZone
+        defer {
+            if let previousTZ {
+                setenv("TZ", previousTZ, 1)
+            } else {
+                unsetenv("TZ")
+            }
+            tzset()
+            CFTimeZoneResetSystem()
+            NSTimeZone.resetSystemTimeZone()
+            NSTimeZone.default = previousDefault
+        }
+
+        var laCal = Calendar(identifier: .gregorian)
+        laCal.timeZone = laZone
+
+        // 2026-11-01 23:59 PST = 2026-11-02T07:59:00Z (the 25-hour fall-back day in Los Angeles).
+        let now = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-11-02T07:59:00Z"))
+        // 2026-10-12 00:30 PDT = 2026-10-12T07:30:00Z (first chart day, before 00:59 PDT).
+        let transcriptTime = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-10-12T07:30:00Z"))
+        let firstChartDayStart = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-10-12T07:00:00Z"))
+
+        // Precondition: fixed `21 * 86_400` seconds would start at 07:59Z and miss the 07:30Z transcript.
+        XCTAssertGreaterThan(now.addingTimeInterval(-21 * 86_400), transcriptTime)
+
+        let scanStart = LocalUsageReader.enrichmentScanStart(now: now, calendar: laCal)
+        XCTAssertEqual(scanStart, firstChartDayStart)
+        XCTAssertEqual(LocalUsageReader.enrichmentScanStart(now: now), firstChartDayStart)
+        XCTAssertLessThanOrEqual(scanStart, transcriptTime)
+
+        // 10 input + 113 output = 123 total tokens on 2026-10-12.
+        try writeSession("dst-fallback-first-day.jsonl", lines: [
+            claudeLine(id: "oct12-early", output: 113, at: transcriptTime),
+        ], mtime: transcriptTime)
+
+        let fullEntries = LocalUsageReader.claudeEntries(modifiedSince: .distantPast, root: root)
+        let selectedEntries = LocalUsageReader.claudeEntries(
+            modifiedSince: LocalUsageReader.enrichmentScanStart(now: now), root: root)
+        let cache = LocalUsageCache(claudeRoot: root, codexRoot: nil, fileURL: cacheFile, now: { now })
+        let cachedEntries = await cache.claudeEntries(
+            modifiedSince: LocalUsageReader.enrichmentScanStart(now: now))
+
+        XCTAssertEqual(fullEntries.reduce(0) { $0 + $1.total }, 123)
+        XCTAssertEqual(selectedEntries.reduce(0) { $0 + $1.total }, 123,
+                       "Selected enrichment scan must include the 00:30 PDT transcript on the first day of the 21d window")
+        XCTAssertEqual(cachedEntries.reduce(0) { $0 + $1.total }, 123,
+                       "Cached enrichment scan must include the 00:30 PDT transcript on the first day of the 21d window")
+
+        let enrichment = ProviderEnrichment.local(entries: cachedEntries, now: now)
+        let recentSeries = try XCTUnwrap(enrichment.recentDaily)
+        XCTAssertEqual(recentSeries.count, 21)
+        XCTAssertEqual(recentSeries.first?.date, "2026-10-12")
+        XCTAssertEqual(recentSeries.first?.totalTokens, 123)
+        XCTAssertEqual(recentSeries.last?.date, "2026-11-01")
+
+        let cols21 = DailyTrendMetrics.columns(series: recentSeries, today: "2026-11-01", window: .d21)
+        XCTAssertEqual(cols21.count, 21)
+        XCTAssertEqual(cols21.first?.date, "2026-10-12")
+        XCTAssertEqual(cols21.first?.tokens, 123)
+        XCTAssertEqual(cols21.reduce(0) { $0 + $1.tokens }, 123)
+    }
 }

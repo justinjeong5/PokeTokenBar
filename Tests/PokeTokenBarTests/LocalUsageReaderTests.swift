@@ -1118,19 +1118,19 @@ final class LocalUsageReaderTests: XCTestCase {
         XCTAssertLessThanOrEqual(scan, now.addingTimeInterval(-LocalUsageReader.blockWindow))
         XCTAssertLessThanOrEqual(scan, now.addingTimeInterval(-LocalUsageReader.recentUseWindow),
                                  "the recent-use window (#336) must not be clipped by the mtime filter")
-        XCTAssertLessThanOrEqual(scan, now.addingTimeInterval(-LocalUsageReader.maxDailyTrendWindow),
+        XCTAssertLessThanOrEqual(scan, LocalUsageReader.startOfRollingWindow(from: now),
                                  "the 21-day rolling daily trend window must not be clipped by the mtime filter")
         XCTAssertLessThan(scan, LocalUsageReader.startOfMonth(now),
                           "월초엔 weekStart 가 더 이르므로 하한이 monthStart 보다 앞서야 한다")
 
-        // 월말(25일 이후): startOfMonth(25일 이상 전)가 maxDailyTrendWindow(21일)보다 앞서므로 하한 == monthStart.
+        // 월말(25일 이후): startOfMonth(25일 이상 전)가 21일 롤링 시작보다 앞서므로 하한 == monthStart.
         let late = cal.date(from: DateComponents(year: 2026, month: 7, day: 28, hour: 12))!
         XCTAssertEqual(LocalUsageReader.enrichmentScanStart(now: late), LocalUsageReader.startOfMonth(late))
 
-        // 월 중순(20일): 21일 전이 전달 말이므로 now - maxDailyTrendWindow 가 startOfMonth 보다 앞선다.
+        // 월 중순(20일): 21일 롤링 창의 첫 날짜(6/30 자정)가 전달 말이므로 startOfMonth(7/1 자정)보다 앞선다.
         let mid = cal.date(from: DateComponents(year: 2026, month: 7, day: 20, hour: 12))!
         XCTAssertEqual(LocalUsageReader.enrichmentScanStart(now: mid),
-                       mid.addingTimeInterval(-LocalUsageReader.maxDailyTrendWindow))
+                       LocalUsageReader.startOfRollingWindow(from: mid))
     }
     // MARK: 파싱 경계 클램프 (딥리뷰 후속 — 크래시 부류)
 

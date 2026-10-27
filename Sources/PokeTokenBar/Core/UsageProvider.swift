@@ -64,7 +64,8 @@ extension ProviderEnrichment {
             entries: entries, periodKey: LocalUsageReader.monthKey(now),
             fromDay: fmt.string(from: monthStart), toDay: fmt.string(from: now))
         let series = LocalUsageReader.monthDailySeries(entries: entries, now: now)
-        let recent = LocalUsageReader.rollingDailySeries(entries: entries, days: 21, now: now)
+        let recent = LocalUsageReader.rollingDailySeries(
+            entries: entries, days: LocalUsageReader.maxDailyTrendWindowDays, now: now)
 
         result.weekTotal = week
         result.monthTotal = month

@@ -1969,8 +1969,7 @@ enum LocalUsageReader {
     {
         var calendar = Calendar.current
         calendar.timeZone = timeZone
-        let clampedDays = max(1, days)
-        let start = calendar.date(byAdding: .day, value: -(clampedDays - 1), to: calendar.startOfDay(for: now)) ?? now
+        let start = startOfRollingWindow(days: days, from: now, calendar: calendar)
         return dailySeries(entries: entries, startDay: start, endDay: now, timeZone: timeZone)
     }
 
@@ -2002,25 +2001,39 @@ enum LocalUsageReader {
         calendar.date(from: calendar.dateComponents([.year, .month], from: date)) ?? date
     }
 
-    static func startOfWeek(_ date: Date) -> Date {
-        Calendar.current.dateInterval(of: .weekOfYear, for: date)?.start ?? date
+    static func startOfWeek(_ date: Date, calendar: Calendar = .current) -> Date {
+        calendar.dateInterval(of: .weekOfYear, for: date)?.start ?? date
     }
 
-    /// enrichment(활성 블록·이번 주·이번 달)를 한 번의 스캔에서 모두 도출하므로, mtime 하한은
-    /// 그 세 윈도우 중 **가장 이른 시작**이어야 한다. append-only 로그에서 "범위 시작 이전에 수정된
+    static let maxDailyTrendWindowDays = 21
+
+    /// First visible day's calendar start (`00:00` in `calendar.timeZone`) for an N-day rolling
+    /// trend ending on `date`. Deriving this via calendar day arithmetic rather than a fixed
+    /// `days * 86_400` second offset keeps the scan lower bound aligned with `00:00` of the first
+    /// chart day even when the window crosses a 25-hour DST fall-back day.
+    static func startOfRollingWindow(days: Int = maxDailyTrendWindowDays, from date: Date,
+                                     calendar: Calendar = .current) -> Date
+    {
+        let clampedDays = max(1, days)
+        let todayStart = calendar.startOfDay(for: date)
+        let targetDay = calendar.date(byAdding: .day, value: -(clampedDays - 1), to: todayStart) ?? todayStart
+        return calendar.startOfDay(for: targetDay)
+    }
+
+    /// enrichment(활성 블록·이번 주·이번 달·롤링 21일 추이)를 한 번의 스캔에서 모두 도출하므로, mtime 하한은
+    /// 모든 표시 윈도우 중 **가장 이른 시작**이어야 한다. append-only 로그에서 "범위 시작 이전에 수정된
     /// 파일엔 범위 내 엔트리가 없다"는 전제가 성립하려면 스캔 하한 ≤ 모든 표시 윈도우의 시작이어야 하기 때문.
     ///
-    /// 함정: monthStart 만 하한으로 쓰면 **월초**에 이번 주 시작(weekStart)이 지난달로 넘어가고
-    /// (2026년 12개월 중 11개월이 그렇다) 자정 직후엔 5h 블록이 어제로 넘어가, 지난달에 수정된 세션
-    /// 파일이 스캔에서 빠지며 주간 합계·번레이트가 며칠간 과소집계된다. min 으로 그 경계를 흡수한다.
-    /// (OpenCode/Hermes 경로엔 이미 `now-7일` 하한이 있었으나 Claude/Codex/Gemini 경로엔 없어
-    /// 드리프트했다 — 네 프로바이더가 이 단일 소스를 공유하게 통일.)
-    static let maxDailyTrendWindow: TimeInterval = 21 * 86_400
-
-    static func enrichmentScanStart(now: Date) -> Date {
-        min(startOfMonth(now), startOfWeek(now), now.addingTimeInterval(-blockWindow),
+    /// 함정: monthStart 만 하한으로 쓰면 **월초**에 이번 주 시작(weekStart)이나 21일 롤링 시작이 지난달로
+    /// 넘어가고 자정 직후엔 5h 블록이 어제로 넘어가, 지난달에 수정된 세션 파일이 스캔에서 빠지며 합계·차트·
+    /// 번레이트가 과소집계된다. 또한 21일 창을 고정 초(`21 * 86400`)로 빼면 25시간인 DST fall-back 날 밤에
+    /// 첫 표시 날짜의 새벽(00:00~00:59) 세션이 잘린다. 달력 기준 첫 표시 날짜 자정을 포함한 min 으로 경계를 흡수한다.
+    static func enrichmentScanStart(now: Date, calendar: Calendar = .current) -> Date {
+        min(startOfMonth(now, calendar: calendar),
+            startOfWeek(now, calendar: calendar),
+            now.addingTimeInterval(-blockWindow),
             now.addingTimeInterval(-LocalUsageReader.recentUseWindow),
-            now.addingTimeInterval(-LocalUsageReader.maxDailyTrendWindow))
+            startOfRollingWindow(days: maxDailyTrendWindowDays, from: now, calendar: calendar))
     }
 
     static func monthKey(_ date: Date) -> String {
